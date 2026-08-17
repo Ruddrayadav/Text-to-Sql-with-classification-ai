@@ -1,214 +1,326 @@
-import json
-import re
-from typing import Any, Literal, TypedDict
-
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import interrupt, Command
+from langgraph.checkpoint.memory import MemorySaver
+from langchain_core.messages import HumanMessage, SystemMessage
+from schemas import generate_compact_agent_schema
+from databaseExe import execute_sql
+from prompt import SQL_PROMPT, AMBIGUITY_PROMPT, SCHEMA_LINKER
+from langchain_google_genai import ChatGoogleGenerativeAI
+from dotenv import load_dotenv
+import re
 
-from main import get_relevant_chunks
+
+load_dotenv()
 
 
-class ConflictingFact(BaseModel):
-    claim: str = Field(description="The conflicting claim found in a source chunk.")
-    source: str = Field(description="The file name or document source for the claim.")
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.5-flash-lite"
+)
 
 
-class ConflictEvaluation(BaseModel):
-    conflict: bool = Field(description="True when the retrieved chunks disagree.")
-    conflicting_facts: list[ConflictingFact] = Field(
-        default_factory=list,
-        description="Concrete facts that conflict with each other.",
+class GraphState(BaseModel):
+    user: str
+
+    # Schema Linker
+    relevant_schema: str = ""
+
+    # Ambiguity Agent
+    is_ambiguous: bool = False
+    reason: str = ""
+
+    # Clarification
+    clarification: str = ""
+
+    # SQL Agent
+    query: str = ""
+
+    # Execute Agent
+    result: str = ""
+
+
+class AmbiguityResult(BaseModel):
+    is_ambiguous: bool = Field(
+        ...,
+        description="If query is unclear, mark True. Otherwise mark False."
     )
-    recommended_action: Literal[
-        "answer_user",
-        "ask_user_which_version_applies",
-        "request_more_context",
-    ] = Field(description="The safest next action.")
-    final_answer: str | None = Field(
-        default=None,
-        description="Final answer when there is no conflict; null when clarification is needed.",
-    )
-    source: str | None = Field(
-        default=None,
-        description="Source filename used for the final answer when conflict is false.",
-    )
 
-
-class AgentState(TypedDict, total=False):
-    query: str
-    relevant_chunks: list[dict[str, Any]]
-    evaluation: dict[str, Any]
-
-
-class CompanyPolicyAgent:
-    def __init__(
-        self,
-        *,
-        model: str = "gemini-2.5-flash-lite",
-        llm: Any | None = None,
-        temperature: float = 0,
-        top_k: int = 8,
-    ) -> None:
-        self.top_k = top_k
-        self.llm = llm or ChatGoogleGenerativeAI(model=model, temperature=temperature)
-        try:
-            self.structured_llm = self.llm.with_structured_output(ConflictEvaluation)
-        except NotImplementedError:
-            self.structured_llm = None
-        self.prompt = ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    """
-                        You are a careful company-policy QA agent. Use only the retrieved chunks
-            to answer — never use outside knowledge.
-
-            Step 1 — Extract atomic facts: from the retrieved chunks, pull out
-            individual facts relevant to the user's question. Each fact must cover
-            exactly ONE attribute (e.g. "annual leave days = 18"), not a whole
-            paragraph or multiple attributes bundled together.
-
-            Step 2 — Compare: group facts that refer to the SAME attribute. Two
-            facts only conflict if they give DIFFERENT VALUES for the SAME specific
-            attribute (e.g. two different numbers for "annual leave days"). Facts on
-            related but different attributes (e.g. "remote work days" vs "annual
-            leave days") are NOT conflicts, even if they appear in the same
-            paragraph or topic.
-
-            Step 3 — Handle drafts separately: if a source is marked as "Draft" or
-            "Proposal" and not yet approved, do not treat it as conflicting with an
-            approved policy. Instead note it separately as a pending change.
-
-            Step 4 — Decide:
-            - If two or more APPROVED sources give different values for the same
-              attribute → conflict=true, list each conflicting fact with its exact
-              value and source, set recommended_action="ask_user_which_version_applies",
-              final_answer=null.
-            - If there is no conflict → answer using the most recent approved
-              source, set recommended_action="answer_user", include the answer in
-              final_answer, and put the exact source filename in source.
-            - If the chunks don't contain enough information to answer →
-              recommended_action="request_more_context", final_answer=null,
-              source=null.
-
-            Always cite the exact source filename for every fact you use.
-            Return only valid JSON with these keys:
-            conflict, conflicting_facts, recommended_action, final_answer, source.
-                    """
-                ),
-                (
-                    "human",
-                    "User query:\n{query}\n\nRetrieved chunks:\n{chunks}",
-                ),
-            ]
+    reason: str = Field(
+        ...,
+        description=(
+            "Only generate this if query is unclear. "
+            "Explain exactly what information is missing."
         )
-        self.graph = self._build_graph()
+    )
 
-    def _build_graph(self):
-        graph = StateGraph(AgentState)
-        graph.add_node("retrieve", self._retrieve)
-        graph.add_node("evaluate", self._evaluate)
-        graph.set_entry_point("retrieve")
-        graph.add_edge("retrieve", "evaluate")
-        graph.add_edge("evaluate", END)
-        return graph.compile()
 
-    def _retrieve(self, state: AgentState) -> AgentState:
-        query = state["query"]
+# CHANGE: SQL output is now structured instead of allowing arbitrary LLM text.
+class SQLResult(BaseModel):
+    query: str = Field(
+        ...,
+        description="Only executable PostgreSQL SQL. Do not include markdown fences or explanations."
+    )
+
+
+structured_ambiguity_llm = llm.with_structured_output(AmbiguityResult)
+
+# CHANGE: SQL generation is now structured to prevent ```sql ... ``` from reaching PostgreSQL.
+structured_sql_llm = llm.with_structured_output(SQLResult)
+
+
+def SchemaLinker(state: GraphState):
+    schemas_data = generate_compact_agent_schema()
+
+    messages = [
+        SystemMessage(
+            content=f"{SCHEMA_LINKER}\n\nSchema:\n{schemas_data}"
+        ),
+        HumanMessage(content=state.user),
+    ]
+
+    answer = llm.invoke(messages)
+
+    return {
+        "relevant_schema": answer.content
+    }
+
+
+def AmbiguityAgent(state: GraphState):
+    messages = [
+        SystemMessage(
+            content=(
+                f"{AMBIGUITY_PROMPT}\n\n"
+                f"Relevant schema:\n{state.relevant_schema}"
+            )
+        ),
+        HumanMessage(
+            content=(
+                f"Original user request:\n{state.user}\n\n"
+                f"Clarification provided by user:\n{state.clarification}"
+            )
+        ),
+    ]
+
+    answer = structured_ambiguity_llm.invoke(messages)
+
+    return {
+        "is_ambiguous": answer.is_ambiguous,
+        "reason": answer.reason
+    }
+
+
+def check_ambiguity(state: GraphState):
+    if state.is_ambiguous:
+        return "clarification"
+
+    return "sqlQuery"
+
+
+def ClarificationAgent(state: GraphState):
+    user_reply = interrupt(
+        {
+            "question": state.reason
+        }
+    )
+
+    # CHANGE: Do not modify state.user. Store the clarification separately.
+    return {
+        "clarification": user_reply
+    }
+
+
+def SQLAgent(state: GraphState):
+    messages = [
+        SystemMessage(
+            content=(
+                f"{SQL_PROMPT}\n\n"
+                f"Relevant schema:\n{state.relevant_schema}\n\n"
+                "IMPORTANT:\n"
+                "Return only executable PostgreSQL SQL.\n"
+                "Do not return markdown code fences.\n"
+                "Do not return explanations.\n"
+                "Do not return ```sql.\n"
+                "The SQL must be read-only."
+            )
+        ),
+        HumanMessage(
+            content=(
+                f"Original user request:\n{state.user}\n\n"
+                f"Clarification:\n{state.clarification}"
+            )
+        ),
+    ]
+
+    answer = structured_sql_llm.invoke(messages)
+
+    query = answer.query.strip()
+
+    query = re.sub(r"^```sql\s*", "", query, flags=re.IGNORECASE)
+    query = re.sub(r"^```\s*", "", query)
+    query = re.sub(r"\s*```$", "", query)
+
+    return {
+        "query": query.strip()
+    }
+
+
+# CHANGE: Added SQL safety validation before sending anything to PostgreSQL.
+def validate_sql(query: str):
+    cleaned_query = query.strip().rstrip(";").strip()
+
+    if not cleaned_query:
+        raise ValueError("Generated SQL query is empty.")
+
+    # CHANGE: Only allow read-only SQL.
+    if not re.match(r"^(SELECT|WITH)\b", cleaned_query, re.IGNORECASE):
+        raise ValueError(
+            "Only SELECT or WITH queries are allowed."
+        )
+
+    # CHANGE: Block destructive/write operations even if they appear later in the query.
+    forbidden_keywords = [
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+        "DROP",
+        "ALTER",
+        "TRUNCATE",
+        "CREATE",
+        "GRANT",
+        "REVOKE",
+    ]
+
+    for keyword in forbidden_keywords:
+        if re.search(
+            rf"\b{keyword}\b",
+            cleaned_query,
+            re.IGNORECASE
+        ):
+            raise ValueError(
+                f"Unsafe SQL detected: {keyword}"
+            )
+
+    return cleaned_query
+
+
+def ExecuteAgent(state: GraphState):
+    try:
+
+        safe_query = validate_sql(state.query)
+
+        sql_result = execute_sql(safe_query)
+
+        messages = [
+            SystemMessage(
+                content=(
+                    "You are a database result formatter.\n"
+                    "The data below came directly from the database.\n"
+                    "Format it clearly for the user.\n"
+                    "Do not invent, calculate, assume, or add information "
+                    "that is not present in the database result.\n"
+                    "Use only the provided data."
+                )
+            ),
+            HumanMessage(
+                content=f"DATA FROM DATABASE:\n{sql_result}"
+            ),
+        ]
+
+        answers = llm.invoke(messages)
+
         return {
-            "relevant_chunks": get_relevant_chunks(query, top_k=self.top_k),
+            "result": answers.content
         }
 
-    def _format_chunks(self, chunks: list[dict[str, Any]]) -> str:
-        if not chunks:
-            return "No relevant chunks were found."
+    except Exception as e:
+        # CHANGE: Store execution errors instead of silently crashing the graph.
+        return {
+            "result": f"SQL execution failed: {str(e)}"
+        }
 
-        formatted_chunks = []
-        for index, chunk in enumerate(chunks, start=1):
-            formatted_chunks.append(
-                f"Chunk {index}\n"
-                f"Source: {chunk.get('source', 'unknown')}\n"
-                f"Text: {chunk.get('chunk', '')}"
-            )
-        return "\n\n".join(formatted_chunks)
 
-    def _evaluate(self, state: AgentState) -> AgentState:
-        chunks = state.get("relevant_chunks", [])
-        messages = self.prompt.invoke(
-            {
-                "query": state["query"],
-                "chunks": self._format_chunks(chunks),
-            }
-        )
-        if self.structured_llm is not None:
-            evaluation = self.structured_llm.invoke(messages)
-            return {"evaluation": evaluation.model_dump()}
+graph = StateGraph(GraphState)
 
-        response = self.llm.invoke(
-            self._build_json_prompt(state["query"], self._format_chunks(chunks))
-        )
-        evaluation = self._parse_json_response(response)
-        return {"evaluation": evaluation.model_dump()}
+graph.add_node("schemaLinker", SchemaLinker)
+graph.add_node("ambiguityAgent", AmbiguityAgent)
+graph.add_node("clarification", ClarificationAgent)
+graph.add_node("sqlQuery", SQLAgent)
+graph.add_node("executeAgent", ExecuteAgent)
 
-    def _build_json_prompt(self, query: str, chunks: str) -> str:
-        return f"""
-You are a company-policy conflict detection agent. Use only the retrieved chunks.
 
-User query:
-{query}
+graph.add_edge(
+    START,
+    "schemaLinker"
+)
 
-Retrieved chunks:
-{chunks}
+graph.add_edge(
+    "schemaLinker",
+    "ambiguityAgent"
+)
 
-Rules:
-- Compare only facts that answer the same specific attribute in the user query.
-- If approved sources disagree, set conflict=true and list the conflicting facts.
-- If a source is a draft/proposal, do not count it as an approved-source conflict.
-- If there is no conflict and enough information exists, answer from the best source.
-- If there is not enough information, use recommended_action="request_more_context".
 
-Return only valid JSON in exactly this shape:
-{{
-  "conflict": true,
-  "conflicting_facts": [
-    {{"claim": "specific claim", "source": "source_filename.txt"}}
-  ],
-  "recommended_action": "answer_user",
-  "final_answer": "answer string or null",
-  "source": "source_filename.txt or null"
-}}
-""".strip()
+graph.add_conditional_edges(
+    "ambiguityAgent",
+    check_ambiguity,
+    {
+        "clarification": "clarification",
+        "sqlQuery": "sqlQuery",
+    },
+)
 
-    def _parse_json_response(self, response: Any) -> ConflictEvaluation:
-        content = getattr(response, "content", response)
-        if isinstance(content, list):
-            content = "".join(
-                item.get("text", "") if isinstance(item, dict) else str(item)
-                for item in content
-            )
 
-        text = str(content).strip()
-        fenced_match = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
-        if fenced_match:
-            text = fenced_match.group(1).strip()
+graph.add_edge(
+    "clarification",
+    "ambiguityAgent"
+)
 
-        json_match = re.search(r"\{.*\}", text, re.DOTALL)
-        if json_match:
-            text = json_match.group(0)
+graph.add_edge(
+    "sqlQuery",
+    "executeAgent"
+)
 
-        return ConflictEvaluation.model_validate(json.loads(text))
+graph.add_edge(
+    "executeAgent",
+    END
+)
 
-    def run(self, query: str) -> dict[str, Any]:
-        if not query.strip():
-            raise ValueError("query cannot be empty.")
 
-        result = self.graph.invoke({"query": query})
-        return result["evaluation"]
+workflow = graph.compile(
+    checkpointer=MemorySaver()
+)
 
 
 if __name__ == "__main__":
-    user_query = input("Enter the query: ")
-    agent = CompanyPolicyAgent()
-    print(agent.run(user_query))
+
+    config = {
+        "configurable": {
+            "thread_id": "test-session-1"
+        }
+    }
+
+    result = workflow.invoke(
+        {
+            "user": "Show me the best customers.c"
+        },
+        config
+    )
+
+    while "__interrupt__" in result:
+
+        question = result["__interrupt__"][0].value["question"]
+
+        user_reply = input(
+            f"\nClarification needed: {question}\n"
+            f"Your answer: "
+        )
+
+        result = workflow.invoke(
+            Command(resume=user_reply),
+            config
+        )
+
+    print("\nGenerated SQL:")
+    print(result["query"])
+
+    print("\nResult:")
+    print(result["result"])
