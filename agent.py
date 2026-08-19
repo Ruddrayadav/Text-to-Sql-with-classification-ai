@@ -54,7 +54,6 @@ class AmbiguityResult(BaseModel):
     )
 
 
-# CHANGE: SQL output is now structured instead of allowing arbitrary LLM text.
 class SQLResult(BaseModel):
     query: str = Field(
         ...,
@@ -64,7 +63,7 @@ class SQLResult(BaseModel):
 
 structured_ambiguity_llm = llm.with_structured_output(AmbiguityResult)
 
-# CHANGE: SQL generation is now structured to prevent ```sql ... ``` from reaching PostgreSQL.
+
 structured_sql_llm = llm.with_structured_output(SQLResult)
 
 
@@ -123,7 +122,7 @@ def ClarificationAgent(state: GraphState):
         }
     )
 
-    # CHANGE: Do not modify state.user. Store the clarification separately.
+  
     return {
         "clarification": user_reply
     }
@@ -164,20 +163,17 @@ def SQLAgent(state: GraphState):
     }
 
 
-# CHANGE: Added SQL safety validation before sending anything to PostgreSQL.
 def validate_sql(query: str):
     cleaned_query = query.strip().rstrip(";").strip()
 
     if not cleaned_query:
         raise ValueError("Generated SQL query is empty.")
 
-    # CHANGE: Only allow read-only SQL.
     if not re.match(r"^(SELECT|WITH)\b", cleaned_query, re.IGNORECASE):
         raise ValueError(
             "Only SELECT or WITH queries are allowed."
         )
 
-    # CHANGE: Block destructive/write operations even if they appear later in the query.
     forbidden_keywords = [
         "INSERT",
         "UPDATE",
@@ -233,7 +229,6 @@ def ExecuteAgent(state: GraphState):
         }
 
     except Exception as e:
-        # CHANGE: Store execution errors instead of silently crashing the graph.
         return {
             "result": f"SQL execution failed: {str(e)}"
         }
