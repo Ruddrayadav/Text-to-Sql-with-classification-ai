@@ -69,19 +69,7 @@ structured_sql_llm = llm.with_structured_output(SQLResult)
 
 def SchemaLinker(state: GraphState):
     schemas_data = generate_compact_agent_schema()
-
-    messages = [
-        SystemMessage(
-            content=f"{SCHEMA_LINKER}\n\nSchema:\n{schemas_data}"
-        ),
-        HumanMessage(content=state.user),
-    ]
-
-    answer = llm.invoke(messages)
-
-    return {
-        "relevant_schema": answer.content
-    }
+    return {"relevant_schema": schemas_data}
 
 
 def AmbiguityAgent(state: GraphState):
