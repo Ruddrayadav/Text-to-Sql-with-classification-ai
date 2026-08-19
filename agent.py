@@ -5,7 +5,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.messages import HumanMessage, SystemMessage
 from schemas import generate_compact_agent_schema
 from databaseExe import execute_sql
-from prompt import SQL_PROMPT, AMBIGUITY_PROMPT
+from prompt import SQL_PROMPT, AMBIGUITY_PROMPT, SCHEMA_LINKER
 from langchain_google_genai import ChatGoogleGenerativeAI
 from dotenv import load_dotenv
 import re
@@ -86,11 +86,10 @@ structured_sql_llm = llm.with_structured_output(SQLResult)
 
 
 def SchemaLinker(state: GraphState):
-    myschemaa = generate_compact_agent_schema()
     # No LLM call here — your schema is small enough (6 tables) that passing
     # it straight through is simpler and free, and it removes one of the
     # guaranteed API calls that were eating into your daily quota.
-    return {"relevant_schema": myschemaa}
+    return {"relevant_schema": generate_compact_agent_schema()}
 
 
 def AmbiguityAgent(state: GraphState):
@@ -190,27 +189,6 @@ def validate_sql(query: str):
     return cleaned_query
 
 
-def format_rows_for_display(rows) -> str:
-    """
-    Plain-Python formatter — no LLM call. Turns query results into a
-    readable markdown list/table. This was previously an LLM call, which
-    burned quota for zero real benefit: formatting known-shape DB rows
-    doesn't need a language model.
-    """
-    if not rows:
-        return "No results found."
-
-    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
-        headers = list(rows[0].keys())
-        lines = ["| " + " | ".join(headers) + " |"]
-        lines.append("|" + "|".join(["---"] * len(headers)) + "|")
-        for row in rows:
-            lines.append("| " + " | ".join(str(row.get(h, "")) for h in headers) + " |")
-        return "\n".join(lines)
-
-    return str(rows)
-
-
 def ExecuteAgent(state: GraphState):
     try:
         safe_query = validate_sql(state.query)
@@ -222,10 +200,27 @@ def ExecuteAgent(state: GraphState):
             "sql_attempts": state.sql_attempts + 1,
         }
 
-    # Formatting is separate from execution now — if this fails, the query
+    # Formatting stays separate from execution — if this fails, the query
     # itself still succeeded, so we don't want to blame the DB or trigger a retry.
-    formatted = format_rows_for_display(sql_result)
-    return {"result": formatted, "last_db_error": ""}
+    messages = [
+        SystemMessage(
+            content=(
+                "You are a database result formatter.\n"
+                "The data below came directly from the database.\n"
+                "Format it clearly for the user.\n"
+                "Do not invent, calculate, assume, or add information "
+                "that is not present in the database result.\n"
+                "If the data is empty, say plainly that no results were found "
+                "— do not guess why.\n"
+                "Use only the provided data."
+            )
+        ),
+        HumanMessage(content=f"DATA FROM DATABASE:\n{sql_result}"),
+    ]
+
+    answer = safe_llm_call(llm.invoke, messages)
+
+    return {"result": answer.content, "last_db_error": ""}
 
 
 def check_execution(state: GraphState):
