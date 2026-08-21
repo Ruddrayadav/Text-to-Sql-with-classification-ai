@@ -99,10 +99,12 @@ STAGES = [
 ]
 
 
-def render_trail(current_stage: str | None, waiting_on_user: bool):
+def render_trail(current_stage: str | None, waiting_on_user: bool, all_done: bool = False):
     html = '<div class="trail">'
     for i, (key, label) in enumerate(STAGES):
-        if waiting_on_user and key == "ambiguityAgent":
+        if all_done:
+            dot_class, label_class = "done", "done"
+        elif waiting_on_user and key == "ambiguityAgent":
             dot_class, label_class = "active", "active"
         elif current_stage is None:
             dot_class, label_class = "", ""
@@ -132,6 +134,8 @@ if "pending_question" not in st.session_state:
     st.session_state.pending_question = None
 if "current_stage" not in st.session_state:
     st.session_state.current_stage = None
+if "run_complete" not in st.session_state:
+    st.session_state.run_complete = False
 
 config = {"configurable": {"thread_id": st.session_state.thread_id}}
 
@@ -147,6 +151,7 @@ with st.sidebar:
         st.session_state.messages = []
         st.session_state.pending_question = None
         st.session_state.current_stage = None
+        st.session_state.run_complete = False
         st.rerun()
     st.divider()
     st.caption(
@@ -162,7 +167,11 @@ st.markdown('<div class="app-tagline">Ask your database a question in plain Engl
 
 trail_slot = st.empty()
 with trail_slot:
-    render_trail(st.session_state.current_stage, st.session_state.pending_question is not None)
+    render_trail(
+        st.session_state.current_stage,
+        st.session_state.pending_question is not None,
+        all_done=st.session_state.run_complete,
+    )
 
 # ---------------------------------------------------------------------------
 # Chat history
@@ -212,13 +221,19 @@ if user_input:
 
     with st.chat_message("assistant", avatar="🗄️"):
         with st.spinner("Working..."):
-            if st.session_state.pending_question:
-                outcome = run_pipeline(Command(resume=user_input))
-            else:
-                st.session_state.current_stage = "schemaLinker"
-                with trail_slot:
-                    render_trail("schemaLinker", False)
-                outcome = run_pipeline({"user": user_input})
+            try:
+                if st.session_state.pending_question:
+                    outcome = run_pipeline(Command(resume=user_input))
+                else:
+                    st.session_state.current_stage = "schemaLinker"
+                    st.session_state.run_complete = False
+                    with trail_slot:
+                        render_trail("schemaLinker", False)
+                    outcome = run_pipeline({"user": user_input})
+            except RuntimeError as e:
+                st.error(str(e))
+                st.session_state.messages.append({"role": "assistant", "content": str(e)})
+                st.stop()
 
         if outcome and "__interrupt__" in outcome:
             question = outcome["__interrupt__"][0].value["question"]
@@ -242,5 +257,6 @@ if user_input:
                 {"role": "assistant", "type": "result", "sql": sql, "content": result}
             )
             st.session_state.current_stage = None
+            st.session_state.run_complete = True
             with trail_slot:
-                render_trail(None, False)
+                render_trail(None, False, all_done=True)
