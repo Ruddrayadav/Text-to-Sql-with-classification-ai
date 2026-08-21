@@ -4,5 +4,4 @@
 .venv
 /chroma_db
 requirements.txt
-echo "__pycache__/" >> .gitignore
 seeeding.py
