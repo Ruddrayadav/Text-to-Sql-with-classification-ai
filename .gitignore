@@ -3,5 +3,4 @@
 /company_docs
 .venv
 /chroma_db
-requirements.txt
 seeeding.py
