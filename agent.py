@@ -5,7 +5,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.messages import HumanMessage, SystemMessage
 from schemas import generate_compact_agent_schema
 from databaseExe import execute_sql
-from prompt import SQL_PROMPT, AMBIGUITY_PROMPT, SCHEMA_LINKER
+from prompt import SQL_PROMPT, AMBIGUITY_PROMPT, SCHEMA_LINKER, SCOPE_GUARD_PROMPT
 from langchain_google_genai import ChatGoogleGenerativeAI
 from dotenv import load_dotenv
 import re
@@ -24,6 +24,10 @@ MAX_SQL_ATTEMPTS = 3
 class GraphState(BaseModel):
     user: str
 
+    # Scope Guard
+    is_valid_db_query: bool = True
+    scope_reason: str = ""
+
     # Schema Linker
     relevant_schema: str = ""
 
@@ -41,6 +45,17 @@ class GraphState(BaseModel):
 
     # Execute Agent
     result: str = ""
+
+
+class ScopeResult(BaseModel):
+    is_valid_db_query: bool = Field(
+        ...,
+        description="TRUE if the request could be answered using the customers/products database. FALSE otherwise."
+    )
+    reason: str = Field(
+        ...,
+        description="Only if FALSE: a short, polite one-sentence explanation for the user."
+    )
 
 
 class AmbiguityResult(BaseModel):
@@ -81,14 +96,35 @@ def safe_llm_call(invoke_fn, *args, **kwargs):
         raise
 
 
+structured_scope_llm = llm.with_structured_output(ScopeResult)
 structured_ambiguity_llm = llm.with_structured_output(AmbiguityResult)
 structured_sql_llm = llm.with_structured_output(SQLResult)
 
 
+def ScopeGuard(state: GraphState):
+    messages = [
+        SystemMessage(content=SCOPE_GUARD_PROMPT),
+        HumanMessage(content=state.user),
+    ]
+
+    answer = safe_llm_call(structured_scope_llm.invoke, messages)
+
+    return {
+        "is_valid_db_query": answer.is_valid_db_query,
+        "scope_reason": answer.reason if not answer.is_valid_db_query else "",
+    }
+
+
+def check_scope(state: GraphState):
+    return "schemaLinker" if state.is_valid_db_query else "rejected"
+
+
+def RejectedAgent(state: GraphState):
+    return {"result": state.scope_reason or "This request isn't something I can answer from the database."}
+
+
 def SchemaLinker(state: GraphState):
-    # No LLM call here — your schema is small enough (6 tables) that passing
-    # it straight through is simpler and free, and it removes one of the
-    # guaranteed API calls that were eating into your daily quota.
+#Directly calling the fucntion saving the api cost
     return {"relevant_schema": generate_compact_agent_schema()}
 
 
@@ -122,8 +158,6 @@ def ClarificationAgent(state: GraphState):
 
 
 def SQLAgent(state: GraphState):
-    # If we're here after a failed execution, include the exact DB error
-    # so the model can self-correct instead of repeating the same mistake.
     error_context = ""
     if state.last_db_error:
         error_context = (
@@ -200,8 +234,6 @@ def ExecuteAgent(state: GraphState):
             "sql_attempts": state.sql_attempts + 1,
         }
 
-    # Formatting stays separate from execution — if this fails, the query
-    # itself still succeeded, so we don't want to blame the DB or trigger a retry.
     messages = [
         SystemMessage(
             content=(
@@ -224,9 +256,6 @@ def ExecuteAgent(state: GraphState):
 
 
 def check_execution(state: GraphState):
-    # No error -> we're done. Error but out of retries -> also done
-    # (the "result" field already holds the failure message for the user).
-    # Error and retries remain -> loop back to SQLAgent with the error context.
     if not state.last_db_error:
         return "done"
     if state.sql_attempts >= MAX_SQL_ATTEMPTS:
@@ -236,13 +265,23 @@ def check_execution(state: GraphState):
 
 graph = StateGraph(GraphState)
 
+graph.add_node("scopeGuard", ScopeGuard)
+graph.add_node("rejected", RejectedAgent)
 graph.add_node("schemaLinker", SchemaLinker)
 graph.add_node("ambiguityAgent", AmbiguityAgent)
 graph.add_node("clarification", ClarificationAgent)
 graph.add_node("sqlQuery", SQLAgent)
 graph.add_node("executeAgent", ExecuteAgent)
 
-graph.add_edge(START, "schemaLinker")
+graph.add_edge(START, "scopeGuard")
+
+graph.add_conditional_edges(
+    "scopeGuard",
+    check_scope,
+    {"schemaLinker": "schemaLinker", "rejected": "rejected"},
+)
+
+graph.add_edge("rejected", END)
 graph.add_edge("schemaLinker", "ambiguityAgent")
 
 graph.add_conditional_edges(
