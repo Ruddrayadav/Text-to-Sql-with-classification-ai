@@ -1,5 +1,7 @@
 from sqlalchemy import create_engine, inspect
-
+from dotenv import load_dotenv
+load_dotenv
+import os
 DATABASE_URL = "postgresql://rudrayadav@localhost:5432/text_to_sql"
 engine = create_engine(DATABASE_URL)
 
@@ -30,7 +32,5 @@ def generate_compact_agent_schema(target_schema="public"):
         schema_output += "\n"
         
     return schema_output
-
-
 
 print(generate_compact_agent_schema())
