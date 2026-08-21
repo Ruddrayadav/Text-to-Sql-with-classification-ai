@@ -1,5 +1,8 @@
 from sqlalchemy import create_engine, text
-DATABASE_URL = "postgresql://rudrayadav@localhost:5432/text_to_sql"
+from dotenv import load_dotenv
+load_dotenv()
+import os
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 engine = create_engine(DATABASE_URL)
 
@@ -12,5 +15,7 @@ def execute_sql(sql_query):
         rows = result.mappings().all()
 
         return rows
+
+
 
 
