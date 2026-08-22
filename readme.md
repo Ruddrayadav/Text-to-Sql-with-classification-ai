@@ -9,9 +9,9 @@ a Streamlit frontend.
 
 ## Demo
 
-**Live Demo:** `https://text-to-sql-with-classification-by-rudra.streamlit.app`
+**Live Demo:** https://text-to-sql-with-classification-by-rudra.streamlit.app
 
-**Repository:** `<your-github-repository-url>`
+**Repository:** https://github.com/Ruddrayadav/Text-to-Sql-with-classification-ai
 
 <!-- Add a screenshot or GIF of the application here -->
 
