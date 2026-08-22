@@ -8,7 +8,7 @@ Adjust the import line below if your file isn't named `graph.py`.
 import uuid
 import streamlit as st
 from langgraph.types import Command
-from agent import workflow  # <-- change "graph" if your pipeline file has a different name
+from agent import workflow  
 
 st.set_page_config(page_title="Ledger — Ask your database", page_icon="🗄️", layout="centered")
 
@@ -136,6 +136,8 @@ if "current_stage" not in st.session_state:
     st.session_state.current_stage = None
 if "run_complete" not in st.session_state:
     st.session_state.run_complete = False
+if "pending_pipeline_input" not in st.session_state:
+    st.session_state.pending_pipeline_input = None
 
 config = {"configurable": {"thread_id": st.session_state.thread_id}}
 
@@ -152,6 +154,7 @@ with st.sidebar:
         st.session_state.pending_question = None
         st.session_state.current_stage = None
         st.session_state.run_complete = False
+        st.session_state.pending_pipeline_input = None
         st.rerun()
     st.divider()
     st.caption(
@@ -209,31 +212,30 @@ def run_pipeline(payload):
 
 
 # ---------------------------------------------------------------------------
-# Chat input
+# Process any pipeline input queued by the previous run (see chat_input
+# section below). Doing this on a dedicated rerun — rather than inline in
+# the same run as the submission — avoids chat_input occasionally "eating"
+# a submission during a slow (multi-second LLM) run.
 # ---------------------------------------------------------------------------
-placeholder = "Type your answer..." if st.session_state.pending_question else "Ask a question about your data..."
-user_input = st.chat_input(placeholder)
-
-if user_input:
-    st.session_state.messages.append({"role": "user", "content": user_input})
-    with st.chat_message("user", avatar="🧑"):
-        st.markdown(user_input)
+if st.session_state.pending_pipeline_input is not None:
+    to_process = st.session_state.pending_pipeline_input
+    st.session_state.pending_pipeline_input = None
 
     with st.chat_message("assistant", avatar="🗄️"):
         with st.spinner("Working..."):
             try:
                 if st.session_state.pending_question:
-                    outcome = run_pipeline(Command(resume=user_input))
+                    outcome = run_pipeline(Command(resume=to_process))
                 else:
                     st.session_state.current_stage = "schemaLinker"
                     st.session_state.run_complete = False
                     with trail_slot:
                         render_trail("schemaLinker", False)
-                    outcome = run_pipeline({"user": user_input})
+                    outcome = run_pipeline({"user": to_process})
             except RuntimeError as e:
                 st.error(str(e))
                 st.session_state.messages.append({"role": "assistant", "content": str(e)})
-                st.stop()
+                outcome = None
 
         if outcome and "__interrupt__" in outcome:
             question = outcome["__interrupt__"][0].value["question"]
@@ -245,10 +247,10 @@ if user_input:
             st.session_state.messages.append({"role": "assistant", "type": "clarify", "content": question})
             with trail_slot:
                 render_trail("ambiguityAgent", True)
-        else:
+        elif outcome:
             st.session_state.pending_question = None
-            sql = outcome.get("query", "") if outcome else ""
-            result = outcome.get("result", "") if outcome else "No result."
+            sql = outcome.get("query", "")
+            result = outcome.get("result", "No result.")
             st.markdown('<div class="panel-label">Generated SQL</div>', unsafe_allow_html=True)
             st.code(sql, language="sql")
             st.markdown('<div class="panel-label">Result</div>', unsafe_allow_html=True)
@@ -260,3 +262,17 @@ if user_input:
             st.session_state.run_complete = True
             with trail_slot:
                 render_trail(None, False, all_done=True)
+
+    st.rerun()
+
+# ---------------------------------------------------------------------------
+# Chat input — only queues the submission and reruns; processing happens
+# above, on the next run, not inline here.
+# ---------------------------------------------------------------------------
+placeholder = "Type your answer..." if st.session_state.pending_question else "Ask a question about your data..."
+user_input = st.chat_input(placeholder)
+
+if user_input:
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    st.session_state.pending_pipeline_input = user_input
+    st.rerun()
