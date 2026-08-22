@@ -245,6 +245,7 @@ def ExecuteAgent(state: GraphState):
                 "If the data is empty, say plainly that no results were found "
                 "— do not guess why.\n"
                 "Use only the provided data."
+                "Always show money in ₹ not in $ "
             )
         ),
         HumanMessage(content=f"DATA FROM DATABASE:\n{sql_result}"),
