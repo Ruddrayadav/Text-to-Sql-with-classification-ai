@@ -15,8 +15,11 @@ a Streamlit frontend.
 
 <!-- Add a screenshot or GIF of the application here -->
 
-<!-- ![Ledger Demo](assets/demo.gif) -->
+![Ledger Demo](demo2.gif)
 
+---
+
+![Ledger Demo](GIF2.gif)
 ---
 
 ## Why this exists
@@ -256,29 +259,6 @@ The evaluation covers:
 * SQL execution failures
 * Retry-loop behavior
 
-### Current evaluation
-
-> **Evaluation set:** 23+ manually curated test cases
-
-Results will be recorded after running the complete test suite:
-
-| Category                    | Tests | Passed | Failed |
-| --------------------------- | ----: | -----: | -----: |
-| Clean queries               |     — |      — |      — |
-| Semantic variations         |     — |      — |      — |
-| Complex queries             |     — |      — |      — |
-| Empty results               |     — |      — |      — |
-| Ambiguous queries           |     — |      — |      — |
-| Invalid schema              |     — |      — |      — |
-| Unrelated requests          |     — |      — |      — |
-| Prompt injection / security |     — |      — |      — |
-| Retry behavior              |     — |      — |      — |
-
-The goal is not only to measure whether generated SQL executes, but
-whether the system actually behaves correctly for the user's request.
-
-A query that executes successfully but answers the wrong question is
-considered a failure.
 
 ---
 
