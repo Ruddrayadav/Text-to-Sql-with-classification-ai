@@ -8,7 +8,7 @@ Adjust the import line below if your file isn't named `graph.py`.
 import uuid
 import streamlit as st
 from langgraph.types import Command
-from agent import workflow  
+from agent import workflow  # <-- change "agent" if your pipeline file has a different name
 
 st.set_page_config(page_title="Ledger — Ask your database", page_icon="🗄️", layout="centered")
 
@@ -84,6 +84,14 @@ h1, h2, h3 { font-family: 'JetBrains Mono', monospace; letter-spacing: -0.02em; 
     font-family: 'JetBrains Mono', monospace; font-size: 10px; letter-spacing: 0.08em;
     text-transform: uppercase; color: var(--text-muted); margin: 18px 0 6px 0;
 }
+
+/* example prompt chips */
+.stButton > button {
+    background: var(--surface-raised); border: 1px solid var(--border);
+    color: var(--text); font-family: 'Inter', sans-serif; font-size: 13px;
+    text-align: left; border-radius: 8px; padding: 10px 14px;
+}
+.stButton > button:hover { border-color: var(--accent); color: var(--accent); }
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -148,7 +156,7 @@ with st.sidebar:
     st.markdown("### 🗄️ Ledger")
     st.caption("Text-to-SQL with a clarification loop")
     st.divider()
-    if st.button("↺ New conversation", use_container_width=True):
+    if st.button("🔁 New conversation", use_container_width=True):
         st.session_state.thread_id = str(uuid.uuid4())
         st.session_state.messages = []
         st.session_state.pending_question = None
@@ -165,7 +173,7 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 # Header
 # ---------------------------------------------------------------------------
-st.markdown('<div class="app-header"><span class="mark">&gt; ledger</span></div>', unsafe_allow_html=True)
+st.markdown('<div class="app-header"><span class="mark">&gt; Text to SQL with clarification engine</span></div>', unsafe_allow_html=True)
 st.markdown('<div class="app-tagline">Ask your database a question in plain English.</div>', unsafe_allow_html=True)
 
 trail_slot = st.empty()
@@ -175,6 +183,26 @@ with trail_slot:
         st.session_state.pending_question is not None,
         all_done=st.session_state.run_complete,
     )
+
+
+EXAMPLE_PROMPTS = [
+    "Show me the top 5 customers by total spending",
+    "Which products are out of stock?",
+    "How many orders were placed last month?",
+]
+
+if not st.session_state.messages:
+    st.markdown(
+        '<div class="panel-label" style="margin-top:8px;">Try asking</div>',
+        unsafe_allow_html=True,
+    )
+    example_cols = st.columns(len(EXAMPLE_PROMPTS))
+    for col, prompt_text in zip(example_cols, EXAMPLE_PROMPTS):
+        with col:
+            if st.button(prompt_text, use_container_width=True, key=f"ex_{prompt_text}"):
+                st.session_state.messages.append({"role": "user", "content": prompt_text})
+                st.session_state.pending_pipeline_input = prompt_text
+                st.rerun()
 
 # ---------------------------------------------------------------------------
 # Chat history
@@ -188,9 +216,10 @@ for msg in st.session_state.messages:
                 unsafe_allow_html=True,
             )
         elif msg.get("type") == "result":
-            st.markdown('<div class="panel-label">Generated SQL</div>', unsafe_allow_html=True)
-            st.code(msg["sql"], language="sql")
-            st.markdown('<div class="panel-label">Result</div>', unsafe_allow_html=True)
+            if msg.get("sql"):
+                st.markdown('<div class="panel-label">Generated SQL</div>', unsafe_allow_html=True)
+                st.code(msg["sql"], language="sql")
+                st.markdown('<div class="panel-label">Result</div>', unsafe_allow_html=True)
             st.markdown(msg["content"])
         else:
             st.markdown(msg["content"])
@@ -251,9 +280,10 @@ if st.session_state.pending_pipeline_input is not None:
             st.session_state.pending_question = None
             sql = outcome.get("query", "")
             result = outcome.get("result", "No result.")
-            st.markdown('<div class="panel-label">Generated SQL</div>', unsafe_allow_html=True)
-            st.code(sql, language="sql")
-            st.markdown('<div class="panel-label">Result</div>', unsafe_allow_html=True)
+            if sql:
+                st.markdown('<div class="panel-label">Generated SQL</div>', unsafe_allow_html=True)
+                st.code(sql, language="sql")
+                st.markdown('<div class="panel-label">Result</div>', unsafe_allow_html=True)
             st.markdown(result)
             st.session_state.messages.append(
                 {"role": "assistant", "type": "result", "sql": sql, "content": result}
